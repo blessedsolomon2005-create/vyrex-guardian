@@ -8,9 +8,10 @@ import fs from 'node:fs/promises';
 
 const GROUP_NAME = 'VYREX';
 const INACTIVITY_DAYS = 7;
-
 const CHECK_INTERVAL = 60 * 60 * 1000;
 const DATA_FILE = './activity.json';
+
+let checking = false;
 
 async function loadActivity() {
   try {
@@ -22,10 +23,10 @@ async function loadActivity() {
   }
 }
 
-async function saveActivity(data) {
+async function saveActivity(activity) {
   await fs.writeFile(
     DATA_FILE,
-    JSON.stringify(data, null, 2)
+    JSON.stringify(activity, null, 2)
   );
 }
 
@@ -36,100 +37,114 @@ async function startBot() {
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
-    printQRInTerminal: false,
     syncFullHistory: false
   });
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', async update => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      console.log(
-        'WhatsApp QR generated. Use a secure terminal to display it.'
-      );
-    }
-
+  sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
     if (connection === 'open') {
       console.log('VYREX GUARDIAN connected.');
     }
 
     if (connection === 'close') {
-      const statusCode =
+      const code =
         lastDisconnect?.error?.output?.statusCode;
 
-      if (statusCode !== DisconnectReason.loggedOut) {
-        setTimeout(startBot, 5000);
+      if (code !== DisconnectReason.loggedOut) {
+        setTimeout(() => {
+          startBot().catch(console.error);
+        }, 5000);
       } else {
-        console.log(
-          'Logged out. Reconnect manually.'
-        );
+        console.log('WhatsApp logged out. Manual reconnection required.');
       }
     }
   });
 
-  let activity = await loadActivity();
+  const activity = await loadActivity();
   const warned = new Set();
 
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const message of messages) {
-      if (!message.key.remoteJid?.endsWith('@g.us')) {
-        continue;
-      }
-
-      if (message.key.fromMe) {
-        continue;
-      }
-
-      const group = message.key.remoteJid;
+      const groupId = message.key.remoteJid;
       const sender = message.key.participant;
 
-      if (!sender) continue;
+      if (
+        !groupId?.endsWith('@g.us') ||
+        !sender ||
+        message.key.fromMe ||
+        !message.message
+      ) {
+        continue;
+      }
 
-      if (!activity[group]) activity[group] = {};
+      try {
+        const metadata = await sock.groupMetadata(groupId);
 
-      activity[group][sender] = Date.now();
+        if (metadata.subject !== GROUP_NAME) {
+          continue;
+        }
 
-      await saveActivity(activity);
+        if (!activity[groupId]) {
+          activity[groupId] = {};
+        }
+
+        activity[groupId][sender] = Date.now();
+
+        warned.delete(`${groupId}:${sender}`);
+
+        await saveActivity(activity);
+      } catch (error) {
+        console.error('Could not record activity:', error.message);
+      }
     }
   });
 
   setInterval(async () => {
-    const groups = await sock.groupFetchAllParticipating();
+    if (checking) return;
+    checking = true;
 
-    for (const [groupId, group] of Object.entries(groups)) {
-      if (group.subject !== GROUP_NAME) continue;
+    try {
+      const groups = await sock.groupFetchAllParticipating();
+      const now = Date.now();
+      const sevenDays = INACTIVITY_DAYS * 24 * 60 * 60 * 1000;
 
-      const participants = group.participants || [];
+      for (const [groupId, group] of Object.entries(groups)) {
+        if (group.subject !== GROUP_NAME) continue;
 
-      for (const participant of participants) {
-        const id = participant.id;
+        const metadata = await sock.groupMetadata(groupId);
 
-        const lastActive =
-          activity[groupId]?.[id] || 0;
+        for (const member of metadata.participants) {
+          const id = member.id;
 
-        const inactiveDays =
-          (Date.now() - lastActive) /
-          (24 * 60 * 60 * 1000);
+          // Never warn members without a recorded activity baseline.
+          const lastActive = activity[groupId]?.[id];
 
-        if (inactiveDays >= INACTIVITY_DAYS) {
+          if (!lastActive) continue;
+
+          if (now - lastActive < sevenDays) continue;
+
           const warningKey = `${groupId}:${id}`;
 
           if (warned.has(warningKey)) continue;
 
           await sock.sendMessage(groupId, {
             text:
-              `@${id.split('@')[0]}, you have been inactive for 7 days. ` +
-              'Please participate in the VYREX group to remain a member.',
+              `@${id.split('@')[0]}, our records show you have not sent a message in VYREX for seven days. Please participate to remain active in the group.`,
             mentions: [id]
           });
 
           warned.add(warningKey);
         }
       }
+    } catch (error) {
+      console.error('Inactivity check failed:', error.message);
+    } finally {
+      checking = false;
     }
   }, CHECK_INTERVAL);
+
+  console.log('VYREX GUARDIAN started. Monitoring is not yet verified.');
 }
 
 startBot().catch(console.error);
